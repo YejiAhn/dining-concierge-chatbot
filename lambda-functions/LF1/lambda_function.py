@@ -10,6 +10,9 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 
 sqs = boto3.client("sqs")
+state_table = boto3.resource("dynamodb").Table(
+    os.environ["STATE_TABLE"]
+)
 NY_TIMEZONE = ZoneInfo("America/New_York")
 CUISINES = {"chinese", "japanese", "italian", "indian", "mexican"}
 
@@ -153,27 +156,107 @@ def lambda_handler(event, context):
         slot_name, prompt = invalid
         return respond(event, "ElicitSlot", prompt, slot_name)
 
-    if source == "DialogCodeHook":
-        return respond(event, "Delegate")
+    values = {
+        slot_name: get_slot(slots, slot_name)
+        for slot_name in PROMPTS
+    }
 
-    # Check completeness again before sending a request.
-    values = {name: get_slot(slots, name) for name in PROMPTS}
     for slot_name, value in values.items():
         if not value:
+            if source == "DialogCodeHook":
+                return respond(event, "Delegate")
+
             return respond(
                 event, "ElicitSlot", PROMPTS[slot_name], slot_name
             )
 
+    user_id = event["sessionId"]
+    cuisine = values["Cuisine"].casefold()
+    attributes = event["sessionState"].setdefault(
+        "sessionAttributes", {}
+    )
+
+    # Keep the exact previous IDs while the user answers the question.
+    cached = attributes.get("previousRecommendation")
+    previous = None
+
+    if cached:
+        previous = json.loads(cached)
+
+        if (
+            previous.get("location") != "Manhattan"
+            or previous.get("cuisine") != cuisine
+        ):
+            previous = None
+            attributes.pop("previousRecommendation", None)
+
+    if previous is None:
+        try:
+            previous = state_table.get_item(
+                Key={"userId": user_id},
+                ConsistentRead=True
+            ).get("Item")
+        except (BotoCoreError, ClientError):
+            print("Failed to read recommendation history.")
+            return respond(
+                event,
+                "Close",
+                "Sorry, I couldn't check your previous request. "
+                "Please try again.",
+                state="Failed"
+            )
+
+    same_search = (
+        previous is not None
+        and previous.get("location") == "Manhattan"
+        and previous.get("cuisine") == cuisine
+        and bool(previous.get("restaurantIds"))
+    )
+
+    reuse = False
+    restaurant_ids = []
+
+    if same_search:
+        choice = get_slot(slots, "ReusePrevious")
+        choice = choice.casefold() if choice else None
+
+        if choice not in {"yes", "no"}:
+            attributes["previousRecommendation"] = json.dumps({
+                "location": previous["location"],
+                "cuisine": previous["cuisine"],
+                "restaurantIds": previous["restaurantIds"]
+            })
+
+            return respond(
+                event,
+                "ElicitSlot",
+                "You previously requested "
+                f"{cuisine.title()} restaurants in Manhattan. "
+                "Would you like the same restaurant recommendations "
+                "as last time? Please say yes or no.",
+                "ReusePrevious"
+            )
+
+        reuse = choice == "yes"
+        if reuse:
+            restaurant_ids = previous["restaurantIds"]
+
+    if source == "DialogCodeHook":
+        return respond(event, "Delegate")
+
     request = {
         "requestId": context.aws_request_id,
+        "userId": user_id,
         "location": "Manhattan",
-        "cuisine": values["Cuisine"].casefold(),
+        "cuisine": cuisine,
         "numberOfPeople": int(Decimal(values["NumberOfPeople"])),
         "diningDate": values["DiningDate"],
         "diningTime": values["DiningTime"],
         "timezone": "America/New_York",
         "email": values["Email"],
-        "createdAt": datetime.now(NY_TIMEZONE).isoformat()
+        "createdAt": datetime.now(NY_TIMEZONE).isoformat(),
+        "reusePrevious": reuse,
+        "restaurantIds": restaurant_ids
     }
 
     try:
@@ -190,11 +273,15 @@ def lambda_handler(event, context):
             state="Failed"
         )
 
+    attributes.pop("previousRecommendation", None)
     print({"sqsMessageId": result["MessageId"]})
 
-    return respond(
-        event,
-        "Close",
-        "You're all set! I've received your request. "
-        "I'll email you restaurant suggestions shortly."
+    text = (
+        "You're all set! I'll email you the same restaurant "
+        "recommendations with your updated dining details."
+        if reuse
+        else "You're all set! I'll email you new restaurant "
+             "suggestions shortly."
     )
+
+    return respond(event, "Close", text)
