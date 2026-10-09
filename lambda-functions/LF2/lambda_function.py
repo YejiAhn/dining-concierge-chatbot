@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import base64
 import json
 import logging
@@ -30,6 +31,7 @@ PASSWORD = os.environ["OPENSEARCH_PASSWORD"]
 FROM_EMAIL = os.environ["SES_FROM_EMAIL"]
 
 table = dynamodb.Table(TABLE_NAME)
+state_table = dynamodb.Table(os.environ["STATE_TABLE"])
 
 
 def find_restaurants(cuisine):
@@ -147,8 +149,42 @@ def send_recommendations(dining_request, restaurants):
     return response["MessageId"]
 
 
+def get_previous_restaurants(restaurant_ids, cuisine):
+    if (
+        not isinstance(restaurant_ids, list)
+        or len(restaurant_ids) != 3
+        or any(
+            not isinstance(business_id, str) or not business_id
+            for business_id in restaurant_ids
+        )
+        or len(set(restaurant_ids)) != 3
+    ):
+        raise ValueError("Expected three unique previous restaurant IDs.")
+
+    restaurants = []
+
+    for business_id in restaurant_ids:
+        response = table.get_item(
+            Key={"businessId": business_id}
+        )
+        item = response.get("Item")
+
+        if not item:
+            raise RuntimeError(
+                f"Previous restaurant missing: {business_id}"
+            )
+
+        if cuisine not in item.get("cuisines", []):
+            raise RuntimeError(
+                f"Previous restaurant cuisine mismatch: {business_id}"
+            )
+
+        restaurants.append(item)
+
+    return restaurants
+
+
 def lambda_handler(event, context):
-    # Process one request per invocation.
     response = sqs.receive_message(
         QueueUrl=QUEUE_URL,
         MaxNumberOfMessages=1,
@@ -169,23 +205,57 @@ def lambda_handler(event, context):
         cuisine = dining_request["cuisine"].strip().lower()
         dining_request["cuisine"] = cuisine
 
-        restaurants = find_restaurants(cuisine)
-        email_id = send_recommendations(dining_request, restaurants)
+        reuse = dining_request.get("reusePrevious") is True
 
-        # Delete only after SES accepts the email.
+        if reuse:
+            restaurants = get_previous_restaurants(
+                dining_request.get("restaurantIds"),
+                cuisine
+            )
+        else:
+            restaurants = find_restaurants(cuisine)
+
+        email_id = send_recommendations(
+            dining_request, restaurants
+        )
+
+        # Save the recommendation after SES accepts the email.
+        # Older queued requests may not have userId.
+        user_id = dining_request.get("userId")
+
+        if user_id:
+            state_table.put_item(
+                Item={
+                    "userId": user_id,
+                    "location": dining_request["location"],
+                    "cuisine": cuisine,
+                    "restaurantIds": [
+                        restaurant["businessId"]
+                        for restaurant in restaurants
+                    ],
+                    "updatedAt": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                    "requestId": dining_request["requestId"]
+                }
+            )
+
+        # Delete after both sending and saving succeed.
         sqs.delete_message(
             QueueUrl=QUEUE_URL,
             ReceiptHandle=message["ReceiptHandle"]
         )
 
         logger.info(
-            "Processed requestId=%s; sesMessageId=%s",
+            "Processed requestId=%s; reused=%s; sesMessageId=%s",
             dining_request.get("requestId", message["MessageId"]),
+            reuse,
             email_id
         )
 
         return {
             "processed": 1,
+            "reusedPrevious": reuse,
             "restaurantCount": len(restaurants),
             "sesMessageId": email_id
         }
