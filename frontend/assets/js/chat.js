@@ -1,4 +1,15 @@
 var checkout = {};
+var chatSessionId = sessionStorage.getItem('diningChatSessionId');
+
+if (!chatSessionId) {
+  chatSessionId =
+    'session-' +
+    Date.now().toString(36) +
+    '-' +
+    Math.random().toString(36).slice(2);
+
+  sessionStorage.setItem('diningChatSessionId', chatSessionId);
+}
 
 $(document).ready(function() {
   var $messages = $('.messages-content'),
@@ -26,11 +37,11 @@ $(document).ready(function() {
   }
 
   function callChatbotApi(message) {
-    // params, body, additionalParams
     return sdk.chatbotPost({}, {
       messages: [{
         type: 'unstructured',
         unstructured: {
+          id: chatSessionId,
           text: message
         }
       }]
