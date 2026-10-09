@@ -1,14 +1,14 @@
 var checkout = {};
-var chatSessionId = sessionStorage.getItem('diningChatSessionId');
+var chatSessionId = localStorage.getItem('diningChatUserId');
 
 if (!chatSessionId) {
   chatSessionId =
-    'session-' +
+    'user-' +
     Date.now().toString(36) +
     '-' +
     Math.random().toString(36).slice(2);
 
-  sessionStorage.setItem('diningChatSessionId', chatSessionId);
+  localStorage.setItem('diningChatUserId', chatSessionId);
 }
 
 $(document).ready(function() {
